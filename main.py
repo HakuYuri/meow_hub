@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any
 import httpx
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey
 from sqlalchemy.orm import sessionmaker, Session, relationship, declarative_base
 
@@ -51,6 +52,24 @@ class PushMessage(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# --- Pydantic 请求模型 ---
+class AuthBase(BaseModel):
+    token: str
+    password: str
+
+class AddDeviceRequest(AuthBase):
+    url: str
+
+class DeleteDeviceRequest(AuthBase):
+    device_id: int
+
+class MessageRequest(AuthBase):
+    limit: int = 50
+
+class ImportRequest(AuthBase):
+    mode: str
+    data: dict
+
 # --- 全局消息队列与客户端 ---
 message_queue = asyncio.Queue()
 http_client: Optional[httpx.AsyncClient] = None
@@ -78,8 +97,7 @@ async def lifespan(app: FastAPI):
     worker_task.cancel()
     await http_client.aclose()
 
-# 关键修复：设置 redirect_slashes=False 禁用自动重定向，防止 307
-app = FastAPI(title="Bark Multi-User Relay", lifespan=lifespan, redirect_slashes=False)
+app = FastAPI(title="Meow Multi-User Relay", lifespan=lifespan, redirect_slashes=False)
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,11 +120,8 @@ def verify_user(db: Session, token: str, password: str):
 async def process_incoming_push(db: Session, token: str, data: dict):
     user = db.query(User).filter(User.token == token).first()
     if not user: return False
-    
-    # 模仿原版：如果标题和内容都为空，视为健康检查或空推送，不入库也不分发
     if not data.get("title") and not data.get("body") and not data.get("markdown"):
         return True
-
     msg = PushMessage(
         user_id=user.id,
         title=data.get("title"),
@@ -120,7 +135,7 @@ async def process_incoming_push(db: Session, token: str, data: dict):
     await message_queue.put({"urls": urls, "payload": data})
     return True
 
-# --- API 路由 ---
+# --- API 路由 (管理类全部改为 POST) ---
 
 @app.post("/register")
 async def register_user(db: Session = Depends(get_db)):
@@ -129,37 +144,37 @@ async def register_user(db: Session = Depends(get_db)):
     db.commit()
     return {"token": user.token, "password": user.password}
 
-@app.get("/config")
-async def get_config(token: str, password: str, db: Session = Depends(get_db)):
-    user = verify_user(db, token, password)
+@app.post("/config")
+async def get_config(req: AuthBase, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
     return {"devices": [{"id": d.id, "url": d.url} for d in user.devices]}
 
 @app.post("/config/add")
-async def add_device(token: str, password: str, url: str, db: Session = Depends(get_db)):
-    user = verify_user(db, token, password)
-    new_device = DownstreamDevice(user_id=user.id, url=url)
+async def add_device(req: AddDeviceRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    new_device = DownstreamDevice(user_id=user.id, url=req.url)
     db.add(new_device)
     db.commit()
     return {"status": "success", "device_id": new_device.id}
 
-@app.delete("/config/delete")
-async def delete_device(token: str, password: str, device_id: int, db: Session = Depends(get_db)):
-    user = verify_user(db, token, password)
-    device = db.query(DownstreamDevice).filter(DownstreamDevice.id == device_id, DownstreamDevice.user_id == user.id).first()
+@app.post("/config/delete")
+async def delete_device(req: DeleteDeviceRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    device = db.query(DownstreamDevice).filter(DownstreamDevice.id == req.device_id, DownstreamDevice.user_id == user.id).first()
     if not device: raise HTTPException(status_code=404)
     db.delete(device)
     db.commit()
     return {"status": "deleted"}
 
-@app.get("/messages")
-async def get_messages(token: str, password: str, limit: int = 50, db: Session = Depends(get_db)):
-    user = verify_user(db, token, password)
-    msgs = db.query(PushMessage).filter(PushMessage.user_id == user.id).order_by(PushMessage.created_at.desc()).limit(limit).all()
+@app.post("/messages")
+async def get_messages(req: MessageRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    msgs = db.query(PushMessage).filter(PushMessage.user_id == user.id).order_by(PushMessage.created_at.desc()).limit(req.limit).all()
     return [{"id": m.id, "title": m.title, "subtitle": m.subtitle, "body": m.body, "created_at": m.created_at, "params": m.raw_params} for m in msgs]
 
-@app.get("/data/export")
-async def export_data(token: str, password: str, db: Session = Depends(get_db)):
-    user = verify_user(db, token, password)
+@app.post("/data/export")
+async def export_data(req: AuthBase, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
     return {
         "export_time": datetime.now().isoformat(),
         "devices": [{"url": d.url} for d in user.devices],
@@ -167,38 +182,31 @@ async def export_data(token: str, password: str, db: Session = Depends(get_db)):
     }
 
 @app.post("/data/import")
-async def import_data(token: str, password: str, mode: str, data: dict = Body(...), db: Session = Depends(get_db)):
-    user = verify_user(db, token, password)
-    if mode == "overwrite":
+async def import_data(req: ImportRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    if req.mode == "overwrite":
         db.query(DownstreamDevice).filter(DownstreamDevice.user_id == user.id).delete()
         db.query(PushMessage).filter(PushMessage.user_id == user.id).delete()
-    if "devices" in data:
-        for d in data["devices"]: db.add(DownstreamDevice(user_id=user.id, url=d["url"]))
-    if "messages" in data:
-        for m in data["messages"]:
+    if "devices" in req.data:
+        for d in req.data["devices"]: db.add(DownstreamDevice(user_id=user.id, url=d["url"]))
+    if "messages" in req.data:
+        for m in req.data["messages"]:
             db.add(PushMessage(user_id=user.id, title=m.get("title"), body=m.get("body"), raw_params=m.get("params"), created_at=datetime.fromisoformat(m["created_at"]) if "created_at" in m else datetime.now()))
     db.commit()
     return {"status": "success"}
 
-# --- Bark 兼容路由 ---
-
-# 支持 GET /{key} 和 GET /{key}/ (不重定向)
+# --- Bark 兼容路由 (保持不变，以兼容协议) ---
 @app.get("/{key}")
 @app.get("/{key}/")
 async def bark_get_base(request: Request, key: str, db: Session = Depends(get_db)):
     params = dict(request.query_params)
-    # 如果没有 body 且没有 title，视为健康检查或空请求
     if not params.get("body") and not params.get("title"):
         user = db.query(User).filter(User.token == key).first()
         if not user: raise HTTPException(status_code=401)
-        # 模拟原版返回 200，但不记录消息
         return {"code": 200, "message": "success", "data": {"status": "health-check"}}
-    
-    if await process_incoming_push(db, key, params):
-        return {"code": 200, "message": "success"}
+    if await process_incoming_push(db, key, params): return {"code": 200, "message": "success"}
     raise HTTPException(status_code=401)
 
-# 处理带路径参数的复杂 GET 请求
 @app.get("/{key}/{body}")
 @app.get("/{key}/{body}/")
 @app.get("/{key}/{title}/{body}")
@@ -211,15 +219,11 @@ async def bark_get_full(request: Request, key: str, body: str, title: str=None, 
     if await process_incoming_push(db, key, p): return {"code": 200, "message": "success"}
     raise HTTPException(status_code=401)
 
-# 处理 POST 请求，增加对 /{key}/ 的显式支持
 @app.post("/{key}")
 @app.post("/{key}/")
 async def bark_post(request: Request, key: str, db: Session=Depends(get_db)):
     try: data = await request.json()
-    except:
-        form_data = await request.form()
-        data = dict(form_data)
-    
+    except: data = dict(await request.form())
     data.update(dict(request.query_params))
     if await process_incoming_push(db, key, data): return {"code": 200, "message": "success"}
     raise HTTPException(status_code=401)
@@ -235,5 +239,4 @@ async def bark_push_json(request: Request, db: Session=Depends(get_db)):
 
 if __name__ == "__main__":
     import uvicorn
-    # 建议 host 设为 0.0.0.0 以便局域网访问
     uvicorn.run(app, host="0.0.0.0", port=8080)
