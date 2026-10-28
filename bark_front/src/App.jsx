@@ -19,7 +19,9 @@ import {
   Database,
   ChevronDown,
   Info,
-  Search
+  Search,
+  Lock,
+  ArrowLeft
 } from 'lucide-react';
 
 const API_BASE = "https://meowapi.3geeks.top";
@@ -44,6 +46,12 @@ export default function App() {
   const [importMode, setImportMode] = useState(null);
   const [copyTip, setCopyTip] = useState(''); // 复制成功提示文本
   const [searchTerm, setSearchTerm] = useState(''); // 搜索关键词
+  // 找回密码：null = 不在找回流程，'request' = 输入 Token，'confirm' = 输入验证码与新密码
+  const [resetStep, setResetStep] = useState(null);
+  const [resetInput, setResetInput] = useState({ token: '', code: '', newPassword: '', confirmPassword: '' });
+  const [resetNotice, setResetNotice] = useState('');
+  const [pwInput, setPwInput] = useState({ current: '', newPassword: '', confirmPassword: '' });
+  const [pwMessage, setPwMessage] = useState({ type: '', text: '' });
 
   // --- 辅助功能 ---
   const copyToClipboard = (text, type = "") => {
@@ -113,6 +121,125 @@ export default function App() {
     }
   };
 
+  const readError = async (res, fallback) => {
+    try {
+      const data = await res.json();
+      return typeof data.detail === 'string' ? data.detail : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const checkNewPassword = (newPassword, confirmPassword) => {
+    if (newPassword.length < 8 || newPassword.length > 128) return '新密码长度需为 8-128 位';
+    if (newPassword !== confirmPassword) return '两次输入的新密码不一致';
+    return '';
+  };
+
+  const saveUser = (u) => {
+    setUser(u);
+    localStorage.setItem('meow_user', JSON.stringify(u));
+  };
+
+  const openReset = () => {
+    setResetStep('request');
+    setResetInput({ token: authInput.token, code: '', newPassword: '', confirmPassword: '' });
+    setResetNotice('');
+    setLoginError('');
+  };
+
+  const closeReset = () => {
+    setResetStep(null);
+    setResetNotice('');
+    setLoginError('');
+  };
+
+  const handleResetRequest = async (e) => {
+    e?.preventDefault();
+    if (!resetInput.token) {
+      setLoginError('请填写推送 Token');
+      return;
+    }
+    setLoading(true);
+    setLoginError('');
+    try {
+      const res = await fetch(`${API_BASE}/password/reset/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: resetInput.token.trim() })
+      });
+      if (!res.ok) {
+        setLoginError(await readError(res, '发送验证码失败'));
+        return;
+      }
+      const data = await res.json();
+      setResetNotice(data.message);
+      setResetStep('confirm');
+    } catch {
+      setLoginError('网络连接失败，请检查 Meow 服务是否运行');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResetConfirm = async (e) => {
+    e.preventDefault();
+    const pwError = checkNewPassword(resetInput.newPassword, resetInput.confirmPassword);
+    if (!resetInput.code) return setLoginError('请填写验证码');
+    if (pwError) return setLoginError(pwError);
+    setLoading(true);
+    setLoginError('');
+    try {
+      const token = resetInput.token.trim();
+      const res = await fetch(`${API_BASE}/password/reset/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, code: resetInput.code.trim(), new_password: resetInput.newPassword })
+      });
+      if (!res.ok) {
+        setLoginError(await readError(res, '重置失败'));
+        return;
+      }
+      closeReset();
+      saveUser({ token, password: resetInput.newPassword });
+    } catch {
+      setLoginError('网络连接失败，请检查 Meow 服务是否运行');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleChangePassword = async (e) => {
+    e.preventDefault();
+    const pwError = checkNewPassword(pwInput.newPassword, pwInput.confirmPassword);
+    if (!pwInput.current) return setPwMessage({ type: 'error', text: '请填写当前密码' });
+    if (pwError) return setPwMessage({ type: 'error', text: pwError });
+    setLoading(true);
+    setPwMessage({ type: '', text: '' });
+    try {
+      const res = await fetch(`${API_BASE}/password/change`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: user.token, password: pwInput.current, new_password: pwInput.newPassword })
+      });
+      if (res.status === 401) {
+        setPwMessage({ type: 'error', text: '当前密码不正确' });
+        return;
+      }
+      if (!res.ok) {
+        setPwMessage({ type: 'error', text: await readError(res, '修改失败') });
+        return;
+      }
+      saveUser({ token: user.token, password: pwInput.newPassword });
+      setPwInput({ current: '', newPassword: '', confirmPassword: '' });
+      setPwMessage({ type: 'success', text: '密码已修改' });
+    } catch {
+      setPwMessage({ type: 'error', text: '网络连接失败，请检查 Meow 服务是否运行' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleLogout = () => {
     setUser(null);
     localStorage.removeItem('meow_user');
@@ -120,6 +247,8 @@ export default function App() {
     setMessages([]);
     setAuthInput({ token: '', password: '' });
     setSearchTerm('');
+    setPwInput({ current: '', newPassword: '', confirmPassword: '' });
+    setPwMessage({ type: '', text: '' });
   };
 
   const fetchDevices = async () => {
@@ -277,7 +406,7 @@ export default function App() {
               <CheckCircle className="text-green-500 w-8 h-8" />
             </div>
             <h1 className="text-2xl font-bold text-slate-800">Meow 账号已就绪</h1>
-            <p className="text-slate-500 text-sm mt-2">请保存好凭证，密码不可找回</p>
+            <p className="text-slate-500 text-sm mt-2">请保存好凭证。登录后可修改密码，绑定设备后可通过推送验证码找回</p>
           </div>
           <div className="space-y-4 mb-8">
             <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 relative">
@@ -307,6 +436,45 @@ export default function App() {
     );
   }
 
+  const inputClass = "w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none";
+
+  if (!user && resetStep) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-3xl shadow-xl border border-slate-100 p-8">
+          <button onClick={closeReset} className="flex items-center gap-1 text-sm text-slate-400 hover:text-slate-600 mb-6"><ArrowLeft size={16}/> 返回登录</button>
+          <div className="text-center mb-8">
+            <div className="bg-blue-500 w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg shadow-blue-200">
+              <Lock className="text-white w-8 h-8" />
+            </div>
+            <h1 className="text-2xl font-bold text-slate-800">找回密码</h1>
+            <p className="text-slate-500 text-sm mt-1">验证码将推送到该账号已绑定的设备</p>
+          </div>
+          {loginError && <div className="mb-6 bg-red-50 border border-red-100 text-red-600 px-4 py-3 rounded-xl flex items-center gap-2 text-sm"><XCircle size={16}/>{loginError}</div>}
+          {resetStep === 'request' ? (
+            <form onSubmit={handleResetRequest} className="space-y-4">
+              <input type="text" placeholder="推送 Token" className={inputClass} value={resetInput.token} onChange={e => {setResetInput({...resetInput, token: e.target.value}); setLoginError('');}} />
+              <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold hover:bg-slate-800 transition flex justify-center items-center gap-2">
+                {loading && <RefreshCcw size={18} className="animate-spin" />} 发送验证码
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={handleResetConfirm} className="space-y-4">
+              {resetNotice && <div className="bg-blue-50 border border-blue-100 text-blue-700 px-4 py-3 rounded-xl flex items-center gap-2 text-sm"><Info size={16} className="flex-shrink-0"/>{resetNotice}</div>}
+              <input type="text" inputMode="numeric" autoComplete="one-time-code" placeholder="6 位验证码" className={inputClass} value={resetInput.code} onChange={e => {setResetInput({...resetInput, code: e.target.value}); setLoginError('');}} />
+              <input type="password" autoComplete="new-password" placeholder="新密码（8-128 位）" className={inputClass} value={resetInput.newPassword} onChange={e => {setResetInput({...resetInput, newPassword: e.target.value}); setLoginError('');}} />
+              <input type="password" autoComplete="new-password" placeholder="确认新密码" className={inputClass} value={resetInput.confirmPassword} onChange={e => {setResetInput({...resetInput, confirmPassword: e.target.value}); setLoginError('');}} />
+              <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold hover:bg-slate-800 transition flex justify-center items-center gap-2">
+                {loading && <RefreshCcw size={18} className="animate-spin" />} 重置密码并登录
+              </button>
+              <button type="button" disabled={loading} onClick={handleResetRequest} className="w-full text-sm text-slate-400 hover:text-slate-600">没收到？重新发送</button>
+            </form>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   if (!user) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
@@ -325,6 +493,7 @@ export default function App() {
             <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold hover:bg-slate-800 transition flex justify-center items-center gap-2">
               {loading && <RefreshCcw size={18} className="animate-spin" />} {loading ? "正在连接..." : "登录 Meow"}
             </button>
+            <button type="button" onClick={openReset} className="w-full text-sm text-slate-400 hover:text-slate-600">忘记密码？</button>
           </form>
           <div className="relative my-8"><div className="absolute inset-0 flex items-center"><span className="w-full border-t border-slate-100"></span></div><div className="relative flex justify-center text-xs uppercase"><span className="bg-white px-2 text-slate-400">或者</span></div></div>
           <button onClick={handleRegister} className="w-full border-2 border-slate-900 text-slate-900 py-3 rounded-xl font-bold hover:bg-slate-50 transition">加入 Meow</button>
@@ -384,6 +553,9 @@ export default function App() {
           </button>
           <button onClick={() => setActiveTab('data')} className={`pb-4 px-2 text-sm font-bold transition-all flex items-center gap-2 ${activeTab === 'data' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400 hover:text-slate-600'}`}>
             <Database size={18} /> 数据备份
+          </button>
+          <button onClick={() => setActiveTab('security')} className={`pb-4 px-2 text-sm font-bold transition-all flex items-center gap-2 ${activeTab === 'security' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400 hover:text-slate-600'}`}>
+            <ShieldCheck size={18} /> 账号安全
           </button>
         </div>
 
@@ -492,6 +664,30 @@ export default function App() {
                   </label>
                   <button onClick={() => setImportMode(null)} className="block mx-auto mt-4 text-xs text-slate-400 hover:underline">取消导入</button>
                 </div>
+              )}
+            </div>
+          </div>
+        )}
+        {activeTab === 'security' && (
+          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <div className="bg-white rounded-3xl p-8 border border-slate-200 shadow-sm max-w-lg">
+              <h3 className="text-xl font-bold mb-2 text-slate-800 flex items-center gap-2"><Lock size={20}/> 修改密码</h3>
+              <p className="text-slate-500 text-sm mb-6">忘记密码时，可在登录页通过推送到已绑定设备的验证码找回。</p>
+              {pwMessage.text && (
+                <div className={`mb-4 px-4 py-3 rounded-xl flex items-center gap-2 text-sm border ${pwMessage.type === 'success' ? 'bg-green-50 border-green-100 text-green-700' : 'bg-red-50 border-red-100 text-red-600'}`}>
+                  {pwMessage.type === 'success' ? <CheckCircle size={16}/> : <XCircle size={16}/>}{pwMessage.text}
+                </div>
+              )}
+              <form onSubmit={handleChangePassword} className="space-y-4">
+                <input type="password" autoComplete="current-password" placeholder="当前密码" className={inputClass} value={pwInput.current} onChange={e => {setPwInput({...pwInput, current: e.target.value}); setPwMessage({ type: '', text: '' });}} />
+                <input type="password" autoComplete="new-password" placeholder="新密码（8-128 位）" className={inputClass} value={pwInput.newPassword} onChange={e => {setPwInput({...pwInput, newPassword: e.target.value}); setPwMessage({ type: '', text: '' });}} />
+                <input type="password" autoComplete="new-password" placeholder="确认新密码" className={inputClass} value={pwInput.confirmPassword} onChange={e => {setPwInput({...pwInput, confirmPassword: e.target.value}); setPwMessage({ type: '', text: '' });}} />
+                <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold hover:bg-slate-800 transition flex justify-center items-center gap-2">
+                  {loading && <RefreshCcw size={18} className="animate-spin" />} 保存新密码
+                </button>
+              </form>
+              {devices.length === 0 && (
+                <p className="mt-4 text-xs text-amber-600 flex items-center gap-1"><AlertTriangle size={14}/> 你还没有绑定任何设备，忘记密码时将无法收到验证码。</p>
               )}
             </div>
           </div>

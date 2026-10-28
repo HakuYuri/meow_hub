@@ -1,9 +1,11 @@
 import os
 import json
+import hmac
 import asyncio
+import hashlib
 import secrets
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
 
@@ -26,7 +28,7 @@ class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
     token = Column(String(64), unique=True, index=True)
-    password = Column(String(64))
+    password = Column(String(255))  # PBKDF2 哈希；历史数据为明文，启动时自动迁移
     created_at = Column(DateTime, default=datetime.now)
     
     devices = relationship("DownstreamDevice", back_populates="owner", cascade="all, delete-orphan")
@@ -50,7 +52,80 @@ class PushMessage(Base):
     created_at = Column(DateTime, default=datetime.now)
     owner = relationship("User", back_populates="messages")
 
+class PasswordReset(Base):
+    __tablename__ = "password_resets"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    code_hash = Column(String(255))
+    attempts = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.now)
+    expires_at = Column(DateTime)
+
 Base.metadata.create_all(bind=engine)
+
+# --- 密码哈希 ---
+HASH_PREFIX = "pbkdf2_sha256"
+HASH_ITERATIONS = 260000
+PASSWORD_MIN_LEN = 8
+PASSWORD_MAX_LEN = 128
+RESET_CODE_TTL = timedelta(minutes=10)
+RESET_CODE_COOLDOWN = timedelta(seconds=60)
+RESET_CODE_MAX_ATTEMPTS = 5
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), HASH_ITERATIONS).hex()
+    return f"{HASH_PREFIX}${HASH_ITERATIONS}${salt}${digest}"
+
+def is_hashed(stored: str) -> bool:
+    return bool(stored) and stored.startswith(HASH_PREFIX + "$")
+
+# 管理接口每次请求都带密码，缓存已验证结果避免每次都跑 PBKDF2（仅存于进程内存）
+_verify_cache_key = secrets.token_bytes(32)
+_verify_cache: Dict[str, str] = {}
+
+def check_password(password: str, stored: str) -> bool:
+    if not stored or not password:
+        return False
+    if not is_hashed(stored):
+        # 兼容尚未迁移的明文密码
+        return hmac.compare_digest(password.encode(), stored.encode())
+    fast = hmac.new(_verify_cache_key, password.encode(), hashlib.sha256).hexdigest()
+    cached = _verify_cache.get(stored)
+    if cached is not None and hmac.compare_digest(cached, fast):
+        return True
+    try:
+        _, iterations, salt, digest = stored.split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(iterations)).hex()
+    except ValueError:
+        return False
+    if hmac.compare_digest(calc, digest):
+        if len(_verify_cache) > 10000:
+            _verify_cache.clear()
+        _verify_cache[stored] = fast
+        return True
+    return False
+
+def migrate_plaintext_passwords():
+    db = SessionLocal()
+    try:
+        users = db.query(User).all()
+        count = 0
+        for u in users:
+            if u.password and not is_hashed(u.password):
+                u.password = hash_password(u.password)
+                count += 1
+        if count:
+            db.commit()
+            logging.warning(f"Migrated {count} plaintext password(s) to PBKDF2 hashes")
+    finally:
+        db.close()
+
+migrate_plaintext_passwords()
+
+def validate_new_password(password: str):
+    if len(password) < PASSWORD_MIN_LEN or len(password) > PASSWORD_MAX_LEN:
+        raise HTTPException(status_code=400, detail=f"密码长度需为 {PASSWORD_MIN_LEN}-{PASSWORD_MAX_LEN} 位")
 
 # --- Pydantic 请求模型 ---
 class AuthBase(BaseModel):
@@ -69,6 +144,17 @@ class MessageRequest(AuthBase):
 class ImportRequest(AuthBase):
     mode: str
     data: dict
+
+class ChangePasswordRequest(AuthBase):
+    new_password: str
+
+class ResetRequest(BaseModel):
+    token: str
+
+class ResetConfirmRequest(BaseModel):
+    token: str
+    code: str
+    new_password: str
 
 # --- 全局消息队列与客户端 ---
 message_queue = asyncio.Queue()
@@ -113,8 +199,9 @@ def get_db():
     finally: db.close()
 
 def verify_user(db: Session, token: str, password: str):
-    user = db.query(User).filter(User.token == token, User.password == password).first()
-    if not user: raise HTTPException(status_code=401, detail="Invalid token or password")
+    user = db.query(User).filter(User.token == token).first()
+    if not user or not check_password(password, user.password):
+        raise HTTPException(status_code=401, detail="Invalid token or password")
     return user
 
 async def process_incoming_push(db: Session, token: str, data: dict):
@@ -139,10 +226,65 @@ async def process_incoming_push(db: Session, token: str, data: dict):
 
 @app.post("/register")
 async def register_user(db: Session = Depends(get_db)):
-    user = User(token=secrets.token_hex(16), password=secrets.token_urlsafe(12))
+    password = secrets.token_urlsafe(12)
+    user = User(token=secrets.token_hex(16), password=hash_password(password))
     db.add(user)
     db.commit()
-    return {"token": user.token, "password": user.password}
+    return {"token": user.token, "password": password}
+
+@app.post("/password/change")
+async def change_password(req: ChangePasswordRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    validate_new_password(req.new_password)
+    user.password = hash_password(req.new_password)
+    db.query(PasswordReset).filter(PasswordReset.user_id == user.id).delete()
+    db.commit()
+    return {"status": "success"}
+
+RESET_SENT_MESSAGE = "如果该 Token 存在且已绑定设备，验证码已推送到你的设备"
+
+@app.post("/password/reset/request")
+async def request_password_reset(req: ResetRequest, db: Session = Depends(get_db)):
+    now = datetime.now()
+    db.query(PasswordReset).filter(PasswordReset.expires_at < now).delete()
+    db.commit()
+    user = db.query(User).filter(User.token == req.token).first()
+    if not user or not user.devices:
+        return {"status": "sent", "message": RESET_SENT_MESSAGE}
+    latest = db.query(PasswordReset).filter(PasswordReset.user_id == user.id).order_by(PasswordReset.created_at.desc()).first()
+    if latest and now - latest.created_at < RESET_CODE_COOLDOWN:
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+    code = f"{secrets.randbelow(10**6):06d}"
+    db.query(PasswordReset).filter(PasswordReset.user_id == user.id).delete()
+    db.add(PasswordReset(user_id=user.id, code_hash=hash_password(code), created_at=now, expires_at=now + RESET_CODE_TTL))
+    db.commit()
+    minutes = int(RESET_CODE_TTL.total_seconds() // 60)
+    payload = {
+        "title": "Meow 密码重置",
+        "body": f"验证码：{code}\n{minutes} 分钟内有效。如非本人操作请忽略。",
+        "group": "Meow",
+    }
+    # 不写入消息历史，直接推送到所有已绑定设备
+    await message_queue.put({"urls": [d.url for d in user.devices], "payload": payload})
+    return {"status": "sent", "message": RESET_SENT_MESSAGE}
+
+@app.post("/password/reset/confirm")
+async def confirm_password_reset(req: ResetConfirmRequest, db: Session = Depends(get_db)):
+    invalid = HTTPException(status_code=400, detail="验证码无效或已过期")
+    user = db.query(User).filter(User.token == req.token).first()
+    if not user: raise invalid
+    reset = db.query(PasswordReset).filter(PasswordReset.user_id == user.id).order_by(PasswordReset.created_at.desc()).first()
+    if not reset or reset.expires_at < datetime.now() or reset.attempts >= RESET_CODE_MAX_ATTEMPTS:
+        raise invalid
+    if not check_password(req.code.strip(), reset.code_hash):
+        reset.attempts += 1
+        db.commit()
+        raise invalid
+    validate_new_password(req.new_password)
+    user.password = hash_password(req.new_password)
+    db.query(PasswordReset).filter(PasswordReset.user_id == user.id).delete()
+    db.commit()
+    return {"status": "success"}
 
 @app.post("/config")
 async def get_config(req: AuthBase, db: Session = Depends(get_db)):
