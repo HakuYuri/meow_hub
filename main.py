@@ -361,21 +361,22 @@ async def bark_get_full(request: Request, key: str, body: str, title: str=None, 
     if await process_incoming_push(db, key, p): return {"code": 200, "message": "success"}
     raise HTTPException(status_code=401)
 
-@app.post("/{key}")
-@app.post("/{key}/")
-async def bark_post(request: Request, key: str, db: Session=Depends(get_db)):
-    try: data = await request.json()
-    except: data = dict(await request.form())
-    data.update(dict(request.query_params))
-    if await process_incoming_push(db, key, data): return {"code": 200, "message": "success"}
-    raise HTTPException(status_code=401)
-
+# 必须注册在 POST /{key} 之前，否则 /push 会被当作 key="push" 匹配
 @app.post("/push")
 @app.post("/push/")
 async def bark_push_json(request: Request, db: Session=Depends(get_db)):
     data = await request.json()
     key = data.get("device_key") or (data.get("device_keys")[0] if data.get("device_keys") else None)
     if not key: raise HTTPException(status_code=400)
+    if await process_incoming_push(db, key, data): return {"code": 200, "message": "success"}
+    raise HTTPException(status_code=401)
+
+@app.post("/{key}")
+@app.post("/{key}/")
+async def bark_post(request: Request, key: str, db: Session=Depends(get_db)):
+    try: data = await request.json()
+    except: data = dict(await request.form())
+    data.update(dict(request.query_params))
     if await process_incoming_push(db, key, data): return {"code": 200, "message": "success"}
     raise HTTPException(status_code=401)
 

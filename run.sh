@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- 1. 获取脚本所在的绝对路径 ---
-APP_DIR="~/meow_hub"
+APP_DIR="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
 VENV_PATH="$APP_DIR/venv"
 
 exec $VENV_PATH/bin/uvicorn main:app \
