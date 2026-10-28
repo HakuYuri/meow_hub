@@ -237,6 +237,9 @@ class ImportRequest(AuthBase):
 class ChangePasswordRequest(AuthBase):
     new_password: str
 
+class ChangeUsernameRequest(AuthBase):
+    new_username: str
+
 class RegisterRequest(BaseModel):
     username: str
     password: str
@@ -356,6 +359,23 @@ async def login(req: LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="用户名或密码不正确")
     _login_failures.pop(username, None)
     return {"username": user.username, "token": user.token}
+
+@app.post("/account/username")
+async def change_username(req: ChangeUsernameRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    username = normalize_username(req.new_username)
+    validate_username(username)
+    if username == user.username:
+        return {"status": "success", "username": username}
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(status_code=409, detail="用户名已被占用")
+    user.username = username
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="用户名已被占用")
+    return {"status": "success", "username": username}
 
 @app.post("/password/change")
 async def change_password(req: ChangePasswordRequest, db: Session = Depends(get_db)):

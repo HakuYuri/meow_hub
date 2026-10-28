@@ -60,6 +60,8 @@ export default function App() {
   const [resetNotice, setResetNotice] = useState('');
   const [pwInput, setPwInput] = useState({ current: '', newPassword: '', confirmPassword: '' });
   const [pwMessage, setPwMessage] = useState({ type: '', text: '' });
+  const [nameInput, setNameInput] = useState({ newUsername: '', password: '' });
+  const [nameMessage, setNameMessage] = useState({ type: '', text: '' });
 
   // --- 辅助功能 ---
   const copyToClipboard = (text, type = "") => {
@@ -250,6 +252,41 @@ export default function App() {
     }
   };
 
+  const handleChangeUsername = async (e) => {
+    e.preventDefault();
+    const newUsername = nameInput.newUsername.trim();
+    if (!newUsername || !nameInput.password) return setNameMessage({ type: 'error', text: '请填写新用户名和当前密码' });
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$/.test(newUsername)) {
+      return setNameMessage({ type: 'error', text: '用户名需为 3-32 位字母、数字或 _ . -，且以字母或数字开头' });
+    }
+    setLoading(true);
+    setNameMessage({ type: '', text: '' });
+    try {
+      const res = await fetch(`${API_BASE}/account/username`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: user.token, password: nameInput.password, new_username: newUsername })
+      });
+      if (res.status === 401) {
+        setNameMessage({ type: 'error', text: '当前密码不正确' });
+        return;
+      }
+      if (!res.ok) {
+        setNameMessage({ type: 'error', text: await readError(res, '修改失败') });
+        return;
+      }
+      const data = await res.json();
+      saveUser({ ...user, username: data.username });
+      setUsername(data.username);
+      setNameInput({ newUsername: '', password: '' });
+      setNameMessage({ type: 'success', text: `用户名已改为 ${data.username}，下次请用新用户名登录` });
+    } catch {
+      setNameMessage({ type: 'error', text: '网络连接失败，请检查 Meow 服务是否运行' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleChangePassword = async (e) => {
     e.preventDefault();
     const pwError = checkNewPassword(pwInput.newPassword, pwInput.confirmPassword);
@@ -292,6 +329,8 @@ export default function App() {
     setSearchTerm('');
     setPwInput({ current: '', newPassword: '', confirmPassword: '' });
     setPwMessage({ type: '', text: '' });
+    setNameInput({ newUsername: '', password: '' });
+    setNameMessage({ type: '', text: '' });
   };
 
   const fetchDevices = async () => {
@@ -780,6 +819,23 @@ export default function App() {
         )}
         {activeTab === 'security' && (
           <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <div className="bg-white rounded-3xl p-8 border border-slate-200 shadow-sm max-w-lg">
+              <h3 className="text-xl font-bold mb-2 text-slate-800 flex items-center gap-2"><Key size={20}/> 修改用户名</h3>
+              <p className="text-slate-500 text-sm mb-6 break-all">当前用户名：<span className="font-mono font-bold text-slate-700">{username || user.username || '—'}</span></p>
+              {nameMessage.text && (
+                <div className={`mb-4 px-4 py-3 rounded-xl flex items-center gap-2 text-sm border ${nameMessage.type === 'success' ? 'bg-green-50 border-green-100 text-green-700' : 'bg-red-50 border-red-100 text-red-600'}`}>
+                  {nameMessage.type === 'success' ? <CheckCircle size={16}/> : <XCircle size={16}/>}{nameMessage.text}
+                </div>
+              )}
+              <form onSubmit={handleChangeUsername} className="space-y-4">
+                <input type="text" autoComplete="username" placeholder="新用户名（3-32 位字母、数字或 _ . -）" className={inputClass} value={nameInput.newUsername} onChange={e => {setNameInput({...nameInput, newUsername: e.target.value}); setNameMessage({ type: '', text: '' });}} />
+                <input type="password" autoComplete="current-password" placeholder="当前密码" className={inputClass} value={nameInput.password} onChange={e => {setNameInput({...nameInput, password: e.target.value}); setNameMessage({ type: '', text: '' });}} />
+                <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold hover:bg-slate-800 transition flex justify-center items-center gap-2">
+                  {loading && <RefreshCcw size={18} className="animate-spin" />} 保存新用户名
+                </button>
+              </form>
+              <p className="mt-4 text-xs text-slate-400">推送 URL 不受影响，修改后无需更新 Bark 等应用的配置。</p>
+            </div>
             <div className="bg-white rounded-3xl p-8 border border-slate-200 shadow-sm max-w-lg">
               <h3 className="text-xl font-bold mb-2 text-slate-800 flex items-center gap-2"><Lock size={20}/> 修改密码</h3>
               <p className="text-slate-500 text-sm mb-6">忘记密码时，可在登录页通过推送到已绑定设备的验证码找回。</p>
