@@ -1,2 +1,3 @@
 venv/
 bark_multiuser.db
+__pycache__/
