@@ -11,12 +11,50 @@ import {
   MinusSquare,
   X,
   CheckCircle,
-  XCircle
+  XCircle,
+  Copy,
+  Check,
+  KeyRound
 } from 'lucide-react';
+import { extractCode } from './otp';
 
 const PAGE_SIZE = 20;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ICON = 'https://day.app/assets/images/avatar.jpg';
+
+const copyText = async (text) => {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // 非安全上下文或旧浏览器的兜底
+    const el = document.createElement('textarea');
+    el.value = text;
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand('copy');
+    document.body.removeChild(el);
+  }
+};
+
+function CodeBadge({ code }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = async (e) => {
+    e.stopPropagation();
+    await copyText(code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+  return (
+    <div className="mt-2 flex items-center gap-3 bg-blue-50 border border-blue-100 rounded-2xl px-3 py-2 w-fit max-w-full">
+      <KeyRound size={16} className="text-blue-500 flex-shrink-0" />
+      <span className="text-xs text-blue-500 font-bold">验证码</span>
+      <span className="font-mono text-lg font-bold tracking-widest text-slate-800 select-all">{code}</span>
+      <button onClick={handleCopy} className={`p-1.5 rounded-lg transition ${copied ? 'text-green-600' : 'text-blue-600 hover:bg-blue-100'}`} title={copied ? '已复制' : '复制验证码'}>
+        {copied ? <Check size={18} /> : <Copy size={18} />}
+      </button>
+    </div>
+  );
+}
 
 // 消息流（mode="inbox"）与回收站（mode="trash"）共用的列表：服务端搜索、多选、批量操作
 export default function MessagesPanel({ apiBase, user, mode, refreshKey, onAuthFail }) {
@@ -261,6 +299,7 @@ export default function MessagesPanel({ apiBase, user, mode, refreshKey, onAuthF
           <div className="space-y-4">
             {messages.map(msg => {
               const checked = allMatching || selected.has(msg.id);
+              const code = extractCode(msg.body, msg.title, msg.subtitle);
               return (
                 <div
                   key={msg.id}
@@ -290,6 +329,7 @@ export default function MessagesPanel({ apiBase, user, mode, refreshKey, onAuthF
                     </div>
                     {msg.subtitle && <p className="text-xs text-slate-500 font-medium mb-1">{msg.subtitle}</p>}
                     <div className="text-sm text-slate-600 leading-relaxed bg-slate-50 p-3 rounded-2xl mt-2 whitespace-pre-wrap break-words">{msg.body}</div>
+                    {code && <CodeBadge code={code} />}
                     {isTrash && msg.deleted_at && (
                       <p className="text-[10px] text-slate-400 mt-2">
                         删除于 {new Date(msg.deleted_at).toLocaleString()} · {daysLeft(msg.deleted_at)} 天后彻底删除
