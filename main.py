@@ -15,7 +15,7 @@ import httpx
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, text
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, text, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker, Session, relationship, declarative_base
 
@@ -55,6 +55,7 @@ class PushMessage(Base):
     body = Column(Text)
     raw_params = Column(JSON)
     created_at = Column(DateTime, default=datetime.now)
+    deleted_at = Column(DateTime)  # 非空表示在回收站，超过 TRASH_RETENTION 后彻底删除
     owner = relationship("User", back_populates="messages")
 
 class PasswordReset(Base):
@@ -169,8 +170,15 @@ def migrate_device_note_column():
     if filled:
         logging.warning(f"Backfilled default note for {filled} device(s)")
 
+def migrate_message_deleted_at_column():
+    with engine.begin() as conn:
+        columns = [row[1] for row in conn.execute(text("PRAGMA table_info(messages)"))]
+        if "deleted_at" not in columns:
+            conn.execute(text("ALTER TABLE messages ADD COLUMN deleted_at DATETIME"))
+
 migrate_username_column()
 migrate_device_note_column()
+migrate_message_deleted_at_column()
 migrate_plaintext_passwords()
 
 USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{2,31}$")
@@ -229,6 +237,18 @@ def resolve_device_note(note: Optional[str], other_notes, position: Optional[int
 
 class MessageRequest(AuthBase):
     limit: int = 50
+    q: Optional[str] = None
+    trash: bool = False
+
+class MessageCountRequest(AuthBase):
+    q: Optional[str] = None
+    trash: bool = False
+
+# 批量操作：指定 ids，或 all_matching=True 作用于当前搜索条件下的全部消息
+class MessageBatchRequest(AuthBase):
+    ids: Optional[List[int]] = None
+    q: Optional[str] = None
+    all_matching: bool = False
 
 class ImportRequest(AuthBase):
     mode: str
@@ -282,13 +302,36 @@ async def bark_worker():
         finally:
             message_queue.task_done()
 
+TRASH_RETENTION = timedelta(days=30)
+
+def purge_expired_trash():
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now() - TRASH_RETENTION
+        n = db.query(PushMessage).filter(PushMessage.deleted_at.isnot(None), PushMessage.deleted_at < cutoff).delete(synchronize_session=False)
+        db.commit()
+        if n:
+            logging.warning(f"Purged {n} message(s) from trash")
+    finally:
+        db.close()
+
+async def trash_purger():
+    while True:
+        try:
+            purge_expired_trash()
+        except Exception as e:
+            logging.error(f"Trash purge error: {e}")
+        await asyncio.sleep(3600)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient()
     worker_task = asyncio.create_task(bark_worker())
+    purge_task = asyncio.create_task(trash_purger())
     yield
     worker_task.cancel()
+    purge_task.cancel()
     await http_client.aclose()
 
 app = FastAPI(title="Meow Multi-User Relay", lifespan=lifespan, redirect_slashes=False)
@@ -464,11 +507,59 @@ async def delete_device(req: DeleteDeviceRequest, db: Session = Depends(get_db))
     db.commit()
     return {"status": "deleted"}
 
+def message_query(db: Session, user_id: int, trash: bool, q: Optional[str] = None):
+    query = db.query(PushMessage).filter(PushMessage.user_id == user_id)
+    query = query.filter(PushMessage.deleted_at.isnot(None) if trash else PushMessage.deleted_at.is_(None))
+    q = (q or "").strip()
+    if q:
+        pattern = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        query = query.filter(or_(
+            PushMessage.title.ilike(pattern, escape="\\"),
+            PushMessage.subtitle.ilike(pattern, escape="\\"),
+            PushMessage.body.ilike(pattern, escape="\\"),
+        ))
+    return query
+
+def batch_target(db: Session, user_id: int, trash: bool, req: MessageBatchRequest):
+    query = message_query(db, user_id, trash, req.q if req.all_matching else None)
+    if req.all_matching:
+        return query
+    if not req.ids:
+        raise HTTPException(status_code=400, detail="未选择任何消息")
+    return query.filter(PushMessage.id.in_(req.ids))
+
 @app.post("/messages")
 async def get_messages(req: MessageRequest, db: Session = Depends(get_db)):
     user = verify_user(db, req.token, req.password)
-    msgs = db.query(PushMessage).filter(PushMessage.user_id == user.id).order_by(PushMessage.created_at.desc()).limit(req.limit).all()
-    return [{"id": m.id, "title": m.title, "subtitle": m.subtitle, "body": m.body, "created_at": m.created_at, "params": m.raw_params} for m in msgs]
+    order = PushMessage.deleted_at.desc() if req.trash else PushMessage.created_at.desc()
+    msgs = message_query(db, user.id, req.trash, req.q).order_by(order, PushMessage.id.desc()).limit(req.limit).all()
+    return [{"id": m.id, "title": m.title, "subtitle": m.subtitle, "body": m.body, "created_at": m.created_at, "deleted_at": m.deleted_at, "params": m.raw_params} for m in msgs]
+
+@app.post("/messages/count")
+async def count_messages(req: MessageCountRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    return {"count": message_query(db, user.id, req.trash, req.q).count(), "retention_days": TRASH_RETENTION.days}
+
+@app.post("/messages/delete")
+async def delete_messages(req: MessageBatchRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    n = batch_target(db, user.id, False, req).update({PushMessage.deleted_at: datetime.now()}, synchronize_session=False)
+    db.commit()
+    return {"status": "success", "count": n}
+
+@app.post("/messages/restore")
+async def restore_messages(req: MessageBatchRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    n = batch_target(db, user.id, True, req).update({PushMessage.deleted_at: None}, synchronize_session=False)
+    db.commit()
+    return {"status": "success", "count": n}
+
+@app.post("/messages/purge")
+async def purge_messages(req: MessageBatchRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    n = batch_target(db, user.id, True, req).delete(synchronize_session=False)
+    db.commit()
+    return {"status": "success", "count": n}
 
 @app.post("/data/export")
 async def export_data(req: AuthBase, db: Session = Depends(get_db)):
@@ -476,7 +567,7 @@ async def export_data(req: AuthBase, db: Session = Depends(get_db)):
     return {
         "export_time": datetime.now().isoformat(),
         "devices": [{"url": d.url, "note": d.note} for d in user.devices],
-        "messages": [{"title": m.title, "body": m.body, "params": m.raw_params, "created_at": m.created_at.isoformat()} for m in user.messages]
+        "messages": [{"title": m.title, "body": m.body, "params": m.raw_params, "created_at": m.created_at.isoformat()} for m in user.messages if m.deleted_at is None]
     }
 
 @app.post("/data/import")

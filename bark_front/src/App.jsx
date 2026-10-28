@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import MessagesPanel from './MessagesPanel';
 import { 
   Send, 
   ShieldCheck, 
@@ -39,9 +40,7 @@ export default function App() {
   const [newRegUser, setNewRegUser] = useState(null);
   const [activeTab, setActiveTab] = useState('messages'); // 默认显示消息页
   const [devices, setDevices] = useState([]);
-  const [messages, setMessages] = useState([]);
-  const [messageLimit, setMessageLimit] = useState(20); // 分页限制
-  const [hasMore, setHasMore] = useState(true); // 是否还有更多消息
+  const [messagesRefreshKey, setMessagesRefreshKey] = useState(0); // 递增以通知消息面板重新加载
   const [newDeviceUrl, setNewDeviceUrl] = useState('');
   const [newDeviceNote, setNewDeviceNote] = useState('');
   const [editingDevice, setEditingDevice] = useState(null); // { id, note }
@@ -53,7 +52,6 @@ export default function App() {
   const [loginError, setLoginError] = useState('');
   const [importMode, setImportMode] = useState(null);
   const [copyTip, setCopyTip] = useState(''); // 复制成功提示文本
-  const [searchTerm, setSearchTerm] = useState(''); // 搜索关键词
   // 找回密码：null = 不在找回流程，'request' = 输入 Token，'confirm' = 输入验证码与新密码
   const [resetStep, setResetStep] = useState(null);
   const [resetInput, setResetInput] = useState({ username: '', code: '', newPassword: '', confirmPassword: '' });
@@ -322,11 +320,9 @@ export default function App() {
     setUser(null);
     localStorage.removeItem('meow_user');
     setDevices([]);
-    setMessages([]);
     setAuthInput({ username: '', password: '', confirmPassword: '' });
     setAuthMode('login');
     setUsername('');
-    setSearchTerm('');
     setPwInput({ current: '', newPassword: '', confirmPassword: '' });
     setPwMessage({ type: '', text: '' });
     setNameInput({ newUsername: '', password: '' });
@@ -416,31 +412,6 @@ export default function App() {
     }
   };
 
-  const fetchMessages = async (limit = messageLimit) => {
-    if (!user) return;
-    setLoading(true);
-    try {
-      // 修改为 POST 请求
-      const res = await fetch(`${API_BASE}/messages`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: user.token, password: user.password, limit: limit })
-      });
-      if (res.status === 401) return handleLogout();
-      const data = await res.json();
-      setMessages(data || []);
-      if (data.length < limit) {
-        setHasMore(false);
-      } else {
-        setHasMore(true);
-      }
-    } catch (err) {
-      console.error("获取消息失败", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const handleExport = async () => {
     setLoading(true);
     try {
@@ -488,7 +459,7 @@ export default function App() {
         if (!res.ok) throw new Error("导入失败");
         alert("数据导入成功！");
         fetchDevices();
-        fetchMessages();
+        setMessagesRefreshKey(k => k + 1);
         setImportMode(null);
       } catch (err) {
         alert("导入失败: " + err.message);
@@ -499,21 +470,11 @@ export default function App() {
     reader.readAsText(file);
   };
 
-  const filteredMessages = messages.filter(m => {
-    const search = searchTerm.toLowerCase();
-    return (
-      (m.title?.toLowerCase().includes(search)) ||
-      (m.subtitle?.toLowerCase().includes(search)) ||
-      (m.body?.toLowerCase().includes(search))
-    );
-  });
-
   useEffect(() => {
     if (user) {
       fetchDevices();
-      fetchMessages(messageLimit);
     }
-  }, [user, messageLimit]);
+  }, [user]);
 
   if (newRegUser) {
     return (
@@ -669,13 +630,16 @@ export default function App() {
         {/* 选项卡 */}
         <div className="flex gap-8 border-b border-slate-200 mb-8 overflow-x-auto whitespace-nowrap">
           <button 
-            onClick={() => { if (activeTab === 'messages') fetchMessages(); setActiveTab('messages'); }} 
+            onClick={() => { if (activeTab === 'messages') setMessagesRefreshKey(k => k + 1); setActiveTab('messages'); }} 
             className={`pb-4 px-2 text-sm font-bold transition-all flex items-center gap-2 ${activeTab === 'messages' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
           >
             <MessageSquare size={18} /> 消息流
           </button>
           <button onClick={() => setActiveTab('devices')} className={`pb-4 px-2 text-sm font-bold transition-all flex items-center gap-2 ${activeTab === 'devices' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400 hover:text-slate-600'}`}>
             <Smartphone size={18} /> 设备分发
+          </button>
+          <button onClick={() => { if (activeTab === 'trash') setMessagesRefreshKey(k => k + 1); setActiveTab('trash'); }} className={`pb-4 px-2 text-sm font-bold transition-all flex items-center gap-2 ${activeTab === 'trash' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400 hover:text-slate-600'}`}>
+            <Trash2 size={18} /> 回收站
           </button>
           <button onClick={() => setActiveTab('data')} className={`pb-4 px-2 text-sm font-bold transition-all flex items-center gap-2 ${activeTab === 'data' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400 hover:text-slate-600'}`}>
             <Database size={18} /> 数据备份
@@ -687,60 +651,11 @@ export default function App() {
 
         {/* 内容 */}
         {activeTab === 'messages' && (
-          <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 px-1">
-              <span className="text-sm font-bold text-slate-500 uppercase tracking-widest flex items-center gap-2">
-                Notification Stream
-              </span>
-              <div className="relative flex-1 max-w-sm">
-                <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input 
-                  type="text" 
-                  placeholder="搜索消息..."
-                  className="w-full pl-10 pr-4 py-2 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-blue-500 transition shadow-sm"
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                />
-              </div>
-              <button onClick={() => fetchMessages()} className="text-blue-600 p-2 rounded-lg hover:bg-blue-50 transition flex items-center gap-1 text-sm font-bold">
-                <RefreshCcw size={18} className={loading ? 'animate-spin' : ''} /> 刷新
-              </button>
-            </div>
+          <MessagesPanel apiBase={API_BASE} user={user} mode="inbox" refreshKey={messagesRefreshKey} onAuthFail={handleLogout} />
+        )}
 
-            {filteredMessages.length === 0 ? (
-              <div className="text-center py-20 bg-white rounded-3xl border border-slate-200 text-slate-400">
-                {searchTerm ? "找不到任何猫鸣记录" : "暂无任何消息记录"}
-              </div>
-            ) : (
-              <>
-                <div className="space-y-4">
-                  {filteredMessages.map(msg => (
-                    <div key={msg.id} className="bg-white p-5 rounded-3xl border border-slate-200 shadow-sm flex gap-4 hover:shadow-md transition">
-                      <img src={msg.params.icon || 'https://day.app/assets/images/avatar.jpg'} className="w-10 h-10 rounded-xl bg-slate-50 flex-shrink-0" onError={e => e.target.src='https://day.app/assets/images/avatar.jpg'} />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex justify-between items-start mb-1">
-                          <h4 className="font-bold text-slate-800 truncate pr-2">{msg.title || '无标题'}</h4>
-                          <span className="text-[10px] text-slate-400 whitespace-nowrap">{new Date(msg.created_at).toLocaleString()}</span>
-                        </div>
-                        {msg.subtitle && <p className="text-xs text-slate-500 font-medium mb-1">{msg.subtitle}</p>}
-                        <div className="text-sm text-slate-600 leading-relaxed bg-slate-50 p-3 rounded-2xl mt-2 whitespace-pre-wrap">{msg.body}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                {hasMore && !searchTerm && (
-                  <button onClick={() => setMessageLimit(prev => prev + 20)} className="w-full mt-6 py-4 flex items-center justify-center gap-2 text-sm font-bold text-slate-500 bg-white border border-slate-200 rounded-3xl hover:bg-slate-50 transition">
-                    <ChevronDown size={18} /> 加载更多消息
-                  </button>
-                )}
-                {!hasMore && !searchTerm && messages.length > 0 && (
-                  <div className="text-center py-8 text-slate-400 flex items-center justify-center gap-2 text-xs">
-                    <Info size={14} /> 这里的猫咪只有这么多了
-                  </div>
-                )}
-              </>
-            )}
-          </div>
+        {activeTab === 'trash' && (
+          <MessagesPanel apiBase={API_BASE} user={user} mode="trash" refreshKey={messagesRefreshKey} onAuthFail={handleLogout} />
         )}
 
         {activeTab === 'devices' && (
