@@ -35,7 +35,7 @@ class User(Base):
     password = Column(String(255))  # PBKDF2 哈希；历史数据为明文，启动时自动迁移
     created_at = Column(DateTime, default=datetime.now)
     
-    devices = relationship("DownstreamDevice", back_populates="owner", cascade="all, delete-orphan")
+    devices = relationship("DownstreamDevice", back_populates="owner", cascade="all, delete-orphan", order_by="DownstreamDevice.id")
     messages = relationship("PushMessage", back_populates="owner", cascade="all, delete-orphan")
 
 class DownstreamDevice(Base):
@@ -43,6 +43,7 @@ class DownstreamDevice(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     url = Column(String(512))
+    note = Column(String(64))  # 备注；留空时默认「设备 N」
     owner = relationship("User", back_populates="devices")
 
 class PushMessage(Base):
@@ -136,7 +137,40 @@ def migrate_username_column():
     if filled:
         logging.warning(f"Backfilled username for {filled} user(s) from token")
 
+DEVICE_NOTE_MAX_LEN = 64
+
+def default_device_note(existing_notes, position: Optional[int] = None) -> str:
+    # 按「第几个地址」命名（position 从 1 开始，默认排在最后），与已有备注重名时顺延
+    taken = set(existing_notes)
+    n = position or len(existing_notes) + 1
+    while f"设备 {n}" in taken:
+        n += 1
+    return f"设备 {n}"
+
+def migrate_device_note_column():
+    with engine.begin() as conn:
+        columns = [row[1] for row in conn.execute(text("PRAGMA table_info(downstream_devices)"))]
+        if "note" not in columns:
+            conn.execute(text("ALTER TABLE downstream_devices ADD COLUMN note VARCHAR(64)"))
+        rows = conn.execute(text("SELECT id, user_id, note FROM downstream_devices ORDER BY user_id, id")).fetchall()
+        notes_by_user: Dict[int, List[str]] = {}
+        for _, user_id, note in rows:
+            if note:
+                notes_by_user.setdefault(user_id, []).append(note)
+        filled = 0
+        for device_id, user_id, note in rows:
+            if note:
+                continue
+            notes = notes_by_user.setdefault(user_id, [])
+            new_note = default_device_note(notes)
+            notes.append(new_note)
+            conn.execute(text("UPDATE downstream_devices SET note = :note WHERE id = :id"), {"note": new_note, "id": device_id})
+            filled += 1
+    if filled:
+        logging.warning(f"Backfilled default note for {filled} device(s)")
+
 migrate_username_column()
+migrate_device_note_column()
 migrate_plaintext_passwords()
 
 USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{2,31}$")
@@ -178,9 +212,20 @@ class AuthBase(BaseModel):
 
 class AddDeviceRequest(AuthBase):
     url: str
+    note: Optional[str] = None
 
 class DeleteDeviceRequest(AuthBase):
     device_id: int
+
+class UpdateDeviceRequest(AuthBase):
+    device_id: int
+    note: Optional[str] = None
+
+def resolve_device_note(note: Optional[str], other_notes, position: Optional[int] = None) -> str:
+    note = (note or "").strip()
+    if len(note) > DEVICE_NOTE_MAX_LEN:
+        raise HTTPException(status_code=400, detail=f"备注最多 {DEVICE_NOTE_MAX_LEN} 个字符")
+    return note or default_device_note(other_notes, position)
 
 class MessageRequest(AuthBase):
     limit: int = 50
@@ -369,15 +414,26 @@ async def confirm_password_reset(req: ResetConfirmRequest, db: Session = Depends
 @app.post("/config")
 async def get_config(req: AuthBase, db: Session = Depends(get_db)):
     user = verify_user(db, req.token, req.password)
-    return {"username": user.username, "devices": [{"id": d.id, "url": d.url} for d in user.devices]}
+    return {"username": user.username, "devices": [{"id": d.id, "url": d.url, "note": d.note} for d in user.devices]}
 
 @app.post("/config/add")
 async def add_device(req: AddDeviceRequest, db: Session = Depends(get_db)):
     user = verify_user(db, req.token, req.password)
-    new_device = DownstreamDevice(user_id=user.id, url=req.url)
+    note = resolve_device_note(req.note, [d.note for d in user.devices])
+    new_device = DownstreamDevice(user_id=user.id, url=req.url, note=note)
     db.add(new_device)
     db.commit()
-    return {"status": "success", "device_id": new_device.id}
+    return {"status": "success", "device_id": new_device.id, "note": note}
+
+@app.post("/config/update")
+async def update_device(req: UpdateDeviceRequest, db: Session = Depends(get_db)):
+    user = verify_user(db, req.token, req.password)
+    device = db.query(DownstreamDevice).filter(DownstreamDevice.id == req.device_id, DownstreamDevice.user_id == user.id).first()
+    if not device: raise HTTPException(status_code=404)
+    position = [d.id for d in user.devices].index(device.id) + 1
+    device.note = resolve_device_note(req.note, [d.note for d in user.devices if d.id != device.id], position)
+    db.commit()
+    return {"status": "success", "note": device.note}
 
 @app.post("/config/delete")
 async def delete_device(req: DeleteDeviceRequest, db: Session = Depends(get_db)):
@@ -399,7 +455,7 @@ async def export_data(req: AuthBase, db: Session = Depends(get_db)):
     user = verify_user(db, req.token, req.password)
     return {
         "export_time": datetime.now().isoformat(),
-        "devices": [{"url": d.url} for d in user.devices],
+        "devices": [{"url": d.url, "note": d.note} for d in user.devices],
         "messages": [{"title": m.title, "body": m.body, "params": m.raw_params, "created_at": m.created_at.isoformat()} for m in user.messages]
     }
 
@@ -410,7 +466,11 @@ async def import_data(req: ImportRequest, db: Session = Depends(get_db)):
         db.query(DownstreamDevice).filter(DownstreamDevice.user_id == user.id).delete()
         db.query(PushMessage).filter(PushMessage.user_id == user.id).delete()
     if "devices" in req.data:
-        for d in req.data["devices"]: db.add(DownstreamDevice(user_id=user.id, url=d["url"]))
+        notes = [] if req.mode == "overwrite" else [d.note for d in user.devices]
+        for d in req.data["devices"]:
+            note = (d.get("note") or "").strip()[:DEVICE_NOTE_MAX_LEN] or default_device_note(notes)
+            notes.append(note)
+            db.add(DownstreamDevice(user_id=user.id, url=d["url"], note=note))
     if "messages" in req.data:
         for m in req.data["messages"]:
             db.add(PushMessage(user_id=user.id, title=m.get("title"), body=m.get("body"), raw_params=m.get("params"), created_at=datetime.fromisoformat(m["created_at"]) if "created_at" in m else datetime.now()))

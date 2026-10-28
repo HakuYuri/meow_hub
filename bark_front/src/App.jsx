@@ -21,7 +21,10 @@ import {
   Info,
   Search,
   Lock,
-  ArrowLeft
+  ArrowLeft,
+  Pencil,
+  Check,
+  X
 } from 'lucide-react';
 
 const API_BASE = "https://meowapi.3geeks.top";
@@ -40,6 +43,9 @@ export default function App() {
   const [messageLimit, setMessageLimit] = useState(20); // 分页限制
   const [hasMore, setHasMore] = useState(true); // 是否还有更多消息
   const [newDeviceUrl, setNewDeviceUrl] = useState('');
+  const [newDeviceNote, setNewDeviceNote] = useState('');
+  const [editingDevice, setEditingDevice] = useState(null); // { id, note }
+  const [deviceError, setDeviceError] = useState('');
   const [loading, setLoading] = useState(false);
   const [authInput, setAuthInput] = useState({ username: '', password: '', confirmPassword: '' });
   const [authMode, setAuthMode] = useState('login'); // 'login' | 'register'
@@ -306,19 +312,54 @@ export default function App() {
     }
   };
 
+  // 与后端一致：按「第几个地址」命名，重名时顺延
+  const defaultDeviceNote = (notes) => {
+    const taken = new Set(notes);
+    let n = notes.length + 1;
+    while (taken.has(`设备 ${n}`)) n += 1;
+    return `设备 ${n}`;
+  };
+
   const addDevice = async () => {
-    if (!newDeviceUrl) return;
+    if (!newDeviceUrl.trim()) return;
+    setDeviceError('');
     try {
-      // 修改为 POST 请求
-      await fetch(`${API_BASE}/config/add`, {
+      const res = await fetch(`${API_BASE}/config/add`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: user.token, password: user.password, url: newDeviceUrl })
+        body: JSON.stringify({ token: user.token, password: user.password, url: newDeviceUrl.trim(), note: newDeviceNote })
       });
+      if (!res.ok) {
+        setDeviceError(await readError(res, '绑定失败'));
+        return;
+      }
       setNewDeviceUrl('');
+      setNewDeviceNote('');
       fetchDevices();
     } catch (err) {
       console.error("添加设备失败", err);
+      setDeviceError('网络连接失败，请检查 Meow 服务是否运行');
+    }
+  };
+
+  const saveDeviceNote = async () => {
+    if (!editingDevice) return;
+    setDeviceError('');
+    try {
+      const res = await fetch(`${API_BASE}/config/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: user.token, password: user.password, device_id: editingDevice.id, note: editingDevice.note })
+      });
+      if (!res.ok) {
+        setDeviceError(await readError(res, '保存备注失败'));
+        return;
+      }
+      setEditingDevice(null);
+      fetchDevices();
+    } catch (err) {
+      console.error("保存备注失败", err);
+      setDeviceError('网络连接失败，请检查 Meow 服务是否运行');
     }
   };
 
@@ -667,19 +708,42 @@ export default function App() {
           <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
             <div className="bg-white rounded-3xl p-6 border border-slate-200 shadow-sm">
               <h3 className="font-bold mb-4 flex items-center gap-2 text-slate-800"><PlusCircle size={18}/> 绑定下级 Bark 地址</h3>
-              <div className="flex gap-3">
-                <input type="text" placeholder="https://api.day.app/..." className="flex-1 px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 transition text-sm" value={newDeviceUrl} onChange={e => setNewDeviceUrl(e.target.value)} />
+              <div className="flex flex-col md:flex-row gap-3">
+                <input type="text" placeholder="https://api.day.app/..." className="flex-1 px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 transition text-sm" value={newDeviceUrl} onChange={e => setNewDeviceUrl(e.target.value)} onKeyDown={e => e.key === 'Enter' && addDevice()} />
+                <input type="text" maxLength={64} placeholder={`备注（留空为「${defaultDeviceNote(devices.map(d => d.note))}」）`} className="md:w-56 px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 transition text-sm" value={newDeviceNote} onChange={e => setNewDeviceNote(e.target.value)} onKeyDown={e => e.key === 'Enter' && addDevice()} />
                 <button onClick={addDevice} className="bg-blue-600 text-white px-6 py-2 rounded-xl font-bold hover:bg-blue-700 transition">绑定</button>
               </div>
+              {deviceError && <p className="mt-3 text-sm text-red-600 flex items-center gap-1"><XCircle size={14}/>{deviceError}</p>}
             </div>
             <div className="grid grid-cols-1 gap-4">
               {devices.map(d => (
                 <div key={d.id} className="bg-white p-5 rounded-3xl border border-slate-200 shadow-sm flex justify-between items-center group">
-                  <div className="min-w-0 pr-4">
-                    <p className="text-[10px] bg-slate-100 text-slate-500 w-fit px-2 py-0.5 rounded-full font-bold mb-2 tracking-wide">ID: {d.id}</p>
-                    <p className="text-sm font-mono text-slate-600 truncate">{d.url}</p>
+                  <div className="min-w-0 flex-1 pr-4">
+                    {editingDevice?.id === d.id ? (
+                      <div className="flex items-center gap-2 mb-2">
+                        <input
+                          type="text"
+                          autoFocus
+                          maxLength={64}
+                          placeholder="留空恢复默认备注"
+                          className="flex-1 min-w-0 px-3 py-1 bg-slate-50 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                          value={editingDevice.note}
+                          onChange={e => setEditingDevice({ ...editingDevice, note: e.target.value })}
+                          onKeyDown={e => { if (e.key === 'Enter') saveDeviceNote(); if (e.key === 'Escape') setEditingDevice(null); }}
+                        />
+                        <button onClick={saveDeviceNote} className="text-blue-600 hover:bg-blue-50 p-1.5 rounded-lg transition" title="保存"><Check size={18}/></button>
+                        <button onClick={() => setEditingDevice(null)} className="text-slate-400 hover:bg-slate-100 p-1.5 rounded-lg transition" title="取消"><X size={18}/></button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 mb-2">
+                        <h4 className="font-bold text-slate-800 truncate">{d.note || `设备 ${d.id}`}</h4>
+                        <span className="text-[10px] bg-slate-100 text-slate-500 px-2 py-0.5 rounded-full font-bold tracking-wide flex-shrink-0">ID: {d.id}</span>
+                        <button onClick={() => { setEditingDevice({ id: d.id, note: d.note || '' }); setDeviceError(''); }} className="text-slate-300 hover:text-blue-500 p-1 transition md:opacity-0 md:group-hover:opacity-100" title="修改备注"><Pencil size={14}/></button>
+                      </div>
+                    )}
+                    <p className="text-sm font-mono text-slate-500 truncate">{d.url}</p>
                   </div>
-                  <button onClick={() => deleteDevice(d.id)} className="text-slate-300 hover:text-red-500 p-2 transition opacity-0 group-hover:opacity-100"><Trash2 size={20}/></button>
+                  <button onClick={() => deleteDevice(d.id)} className="text-slate-300 hover:text-red-500 p-2 transition md:opacity-0 md:group-hover:opacity-100"><Trash2 size={20}/></button>
                 </div>
               ))}
             </div>
