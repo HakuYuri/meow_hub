@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import time
 import hmac
 import asyncio
 import hashlib
@@ -13,7 +15,8 @@ import httpx
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker, Session, relationship, declarative_base
 
 # --- 配置部分 ---
@@ -28,6 +31,7 @@ class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
     token = Column(String(64), unique=True, index=True)
+    username = Column(String(64), unique=True, index=True)  # 小写存储；老用户迁移时以 token 作为用户名
     password = Column(String(255))  # PBKDF2 哈希；历史数据为明文，启动时自动迁移
     created_at = Column(DateTime, default=datetime.now)
     
@@ -121,7 +125,47 @@ def migrate_plaintext_passwords():
     finally:
         db.close()
 
+def migrate_username_column():
+    # create_all 不会给已有表加列，这里手动补 username 列并用 token 回填老用户
+    with engine.begin() as conn:
+        columns = [row[1] for row in conn.execute(text("PRAGMA table_info(users)"))]
+        if "username" not in columns:
+            conn.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(64)"))
+        filled = conn.execute(text("UPDATE users SET username = token WHERE username IS NULL")).rowcount
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username ON users (username)"))
+    if filled:
+        logging.warning(f"Backfilled username for {filled} user(s) from token")
+
+migrate_username_column()
 migrate_plaintext_passwords()
+
+USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{2,31}$")
+
+def normalize_username(username: str) -> str:
+    return (username or "").strip().lower()
+
+def validate_username(username: str):
+    if not USERNAME_PATTERN.match(username):
+        raise HTTPException(status_code=400, detail="用户名需为 3-32 位字母、数字或 _ . -，且以字母或数字开头")
+
+# 登录失败限流（进程内存）：同一用户名 15 分钟内最多失败 10 次
+LOGIN_FAIL_LIMIT = 10
+LOGIN_FAIL_WINDOW = 15 * 60
+_login_failures: Dict[str, List[float]] = {}
+
+def login_blocked(username: str) -> bool:
+    now = time.monotonic()
+    recent = [t for t in _login_failures.get(username, []) if now - t < LOGIN_FAIL_WINDOW]
+    if recent:
+        _login_failures[username] = recent
+    else:
+        _login_failures.pop(username, None)
+    return len(recent) >= LOGIN_FAIL_LIMIT
+
+def record_login_failure(username: str):
+    if len(_login_failures) > 10000:
+        _login_failures.clear()
+    _login_failures.setdefault(username, []).append(time.monotonic())
 
 def validate_new_password(password: str):
     if len(password) < PASSWORD_MIN_LEN or len(password) > PASSWORD_MAX_LEN:
@@ -148,13 +192,29 @@ class ImportRequest(AuthBase):
 class ChangePasswordRequest(AuthBase):
     new_password: str
 
-class ResetRequest(BaseModel):
-    token: str
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
 
-class ResetConfirmRequest(BaseModel):
-    token: str
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+# 找回密码按用户名定位；token 字段保留给旧版前端
+class ResetRequest(BaseModel):
+    username: Optional[str] = None
+    token: Optional[str] = None
+
+class ResetConfirmRequest(ResetRequest):
     code: str
     new_password: str
+
+def find_reset_user(db: Session, req: ResetRequest) -> Optional["User"]:
+    if req.username:
+        return db.query(User).filter(User.username == normalize_username(req.username)).first()
+    if req.token:
+        return db.query(User).filter(User.token == req.token.strip()).first()
+    return None
 
 # --- 全局消息队列与客户端 ---
 message_queue = asyncio.Queue()
@@ -225,12 +285,32 @@ async def process_incoming_push(db: Session, token: str, data: dict):
 # --- API 路由 (管理类全部改为 POST) ---
 
 @app.post("/register")
-async def register_user(db: Session = Depends(get_db)):
-    password = secrets.token_urlsafe(12)
-    user = User(token=secrets.token_hex(16), password=hash_password(password))
+async def register_user(req: RegisterRequest, db: Session = Depends(get_db)):
+    username = normalize_username(req.username)
+    validate_username(username)
+    validate_new_password(req.password)
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(status_code=409, detail="用户名已被占用")
+    user = User(token=secrets.token_hex(16), username=username, password=hash_password(req.password))
     db.add(user)
-    db.commit()
-    return {"token": user.token, "password": password}
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="用户名已被占用")
+    return {"username": user.username, "token": user.token}
+
+@app.post("/login")
+async def login(req: LoginRequest, db: Session = Depends(get_db)):
+    username = normalize_username(req.username)
+    if login_blocked(username):
+        raise HTTPException(status_code=429, detail="登录失败次数过多，请 15 分钟后再试")
+    user = db.query(User).filter(User.username == username).first()
+    if not user or not check_password(req.password, user.password):
+        record_login_failure(username)
+        raise HTTPException(status_code=401, detail="用户名或密码不正确")
+    _login_failures.pop(username, None)
+    return {"username": user.username, "token": user.token}
 
 @app.post("/password/change")
 async def change_password(req: ChangePasswordRequest, db: Session = Depends(get_db)):
@@ -241,14 +321,14 @@ async def change_password(req: ChangePasswordRequest, db: Session = Depends(get_
     db.commit()
     return {"status": "success"}
 
-RESET_SENT_MESSAGE = "如果该 Token 存在且已绑定设备，验证码已推送到你的设备"
+RESET_SENT_MESSAGE = "如果该用户存在且已绑定设备，验证码已推送到你的设备"
 
 @app.post("/password/reset/request")
 async def request_password_reset(req: ResetRequest, db: Session = Depends(get_db)):
     now = datetime.now()
     db.query(PasswordReset).filter(PasswordReset.expires_at < now).delete()
     db.commit()
-    user = db.query(User).filter(User.token == req.token).first()
+    user = find_reset_user(db, req)
     if not user or not user.devices:
         return {"status": "sent", "message": RESET_SENT_MESSAGE}
     latest = db.query(PasswordReset).filter(PasswordReset.user_id == user.id).order_by(PasswordReset.created_at.desc()).first()
@@ -271,7 +351,7 @@ async def request_password_reset(req: ResetRequest, db: Session = Depends(get_db
 @app.post("/password/reset/confirm")
 async def confirm_password_reset(req: ResetConfirmRequest, db: Session = Depends(get_db)):
     invalid = HTTPException(status_code=400, detail="验证码无效或已过期")
-    user = db.query(User).filter(User.token == req.token).first()
+    user = find_reset_user(db, req)
     if not user: raise invalid
     reset = db.query(PasswordReset).filter(PasswordReset.user_id == user.id).order_by(PasswordReset.created_at.desc()).first()
     if not reset or reset.expires_at < datetime.now() or reset.attempts >= RESET_CODE_MAX_ATTEMPTS:
@@ -289,7 +369,7 @@ async def confirm_password_reset(req: ResetConfirmRequest, db: Session = Depends
 @app.post("/config")
 async def get_config(req: AuthBase, db: Session = Depends(get_db)):
     user = verify_user(db, req.token, req.password)
-    return {"devices": [{"id": d.id, "url": d.url} for d in user.devices]}
+    return {"username": user.username, "devices": [{"id": d.id, "url": d.url} for d in user.devices]}
 
 @app.post("/config/add")
 async def add_device(req: AddDeviceRequest, db: Session = Depends(get_db)):

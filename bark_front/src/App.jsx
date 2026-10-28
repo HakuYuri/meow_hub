@@ -41,14 +41,16 @@ export default function App() {
   const [hasMore, setHasMore] = useState(true); // 是否还有更多消息
   const [newDeviceUrl, setNewDeviceUrl] = useState('');
   const [loading, setLoading] = useState(false);
-  const [authInput, setAuthInput] = useState({ token: '', password: '' });
+  const [authInput, setAuthInput] = useState({ username: '', password: '', confirmPassword: '' });
+  const [authMode, setAuthMode] = useState('login'); // 'login' | 'register'
+  const [username, setUsername] = useState('');
   const [loginError, setLoginError] = useState('');
   const [importMode, setImportMode] = useState(null);
   const [copyTip, setCopyTip] = useState(''); // 复制成功提示文本
   const [searchTerm, setSearchTerm] = useState(''); // 搜索关键词
   // 找回密码：null = 不在找回流程，'request' = 输入 Token，'confirm' = 输入验证码与新密码
   const [resetStep, setResetStep] = useState(null);
-  const [resetInput, setResetInput] = useState({ token: '', code: '', newPassword: '', confirmPassword: '' });
+  const [resetInput, setResetInput] = useState({ username: '', code: '', newPassword: '', confirmPassword: '' });
   const [resetNotice, setResetNotice] = useState('');
   const [pwInput, setPwInput] = useState({ current: '', newPassword: '', confirmPassword: '' });
   const [pwMessage, setPwMessage] = useState({ type: '', text: '' });
@@ -68,15 +70,37 @@ export default function App() {
 
   // --- API 调用 ---
   
-  const handleRegister = async () => {
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    const username = authInput.username.trim();
+    if (!username || !authInput.password) {
+      setLoginError('请填写用户名和密码');
+      return;
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$/.test(username)) {
+      setLoginError('用户名需为 3-32 位字母、数字或 _ . -，且以字母或数字开头');
+      return;
+    }
+    const pwError = checkNewPassword(authInput.password, authInput.confirmPassword);
+    if (pwError) {
+      setLoginError(pwError.replace('新密码', '密码'));
+      return;
+    }
     setLoading(true);
     setLoginError('');
     try {
-      const res = await fetch(`${API_BASE}/register`, { method: 'POST' });
-      if (!res.ok) throw new Error("注册失败");
+      const res = await fetch(`${API_BASE}/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password: authInput.password })
+      });
+      if (!res.ok) {
+        setLoginError(await readError(res, '注册失败'));
+        return;
+      }
       const data = await res.json();
-      setNewRegUser({ token: data.token, password: data.password });
-    } catch (err) {
+      setNewRegUser({ token: data.token, username: data.username, password: authInput.password });
+    } catch {
       setLoginError("无法连接到服务器，请确保 Meow 后端已启动");
     } finally {
       setLoading(false);
@@ -85,36 +109,36 @@ export default function App() {
 
   const confirmRegistration = () => {
     if (newRegUser) {
-      setUser(newRegUser);
-      localStorage.setItem('meow_user', JSON.stringify(newRegUser));
+      saveUser(newRegUser);
       setNewRegUser(null);
+      setAuthInput({ username: '', password: '', confirmPassword: '' });
     }
   };
 
   const handleLogin = async (e) => {
     e.preventDefault();
-    if (!authInput.token || !authInput.password) {
+    if (!authInput.username.trim() || !authInput.password) {
       setLoginError('请填写完整信息');
       return;
     }
     setLoading(true);
     setLoginError('');
     try {
-      // 修改为 POST 请求，密码写在请求体中
-      const res = await fetch(`${API_BASE}/config`, {
+      const res = await fetch(`${API_BASE}/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: authInput.token, password: authInput.password })
+        body: JSON.stringify({ username: authInput.username.trim(), password: authInput.password })
       });
       if (res.ok) {
-        setUser(authInput);
-        localStorage.setItem('meow_user', JSON.stringify(authInput));
-      } else if (res.status === 401) {
-        setLoginError('Token 或密码不正确');
+        const data = await res.json();
+        saveUser({ token: data.token, username: data.username, password: authInput.password });
+        setAuthInput({ username: '', password: '', confirmPassword: '' });
+      } else if (res.status === 401 || res.status === 429) {
+        setLoginError(await readError(res, '用户名或密码不正确'));
       } else {
         setLoginError('服务器响应异常');
       }
-    } catch (err) {
+    } catch {
       setLoginError('网络连接失败，请检查 Meow 服务是否运行');
     } finally {
       setLoading(false);
@@ -143,7 +167,7 @@ export default function App() {
 
   const openReset = () => {
     setResetStep('request');
-    setResetInput({ token: authInput.token, code: '', newPassword: '', confirmPassword: '' });
+    setResetInput({ username: authInput.username, code: '', newPassword: '', confirmPassword: '' });
     setResetNotice('');
     setLoginError('');
   };
@@ -156,8 +180,8 @@ export default function App() {
 
   const handleResetRequest = async (e) => {
     e?.preventDefault();
-    if (!resetInput.token) {
-      setLoginError('请填写推送 Token');
+    if (!resetInput.username.trim()) {
+      setLoginError('请填写用户名');
       return;
     }
     setLoading(true);
@@ -166,7 +190,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/password/reset/request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: resetInput.token.trim() })
+        body: JSON.stringify({ username: resetInput.username.trim() })
       });
       if (!res.ok) {
         setLoginError(await readError(res, '发送验证码失败'));
@@ -190,18 +214,29 @@ export default function App() {
     setLoading(true);
     setLoginError('');
     try {
-      const token = resetInput.token.trim();
+      const name = resetInput.username.trim();
       const res = await fetch(`${API_BASE}/password/reset/confirm`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token, code: resetInput.code.trim(), new_password: resetInput.newPassword })
+        body: JSON.stringify({ username: name, code: resetInput.code.trim(), new_password: resetInput.newPassword })
       });
       if (!res.ok) {
         setLoginError(await readError(res, '重置失败'));
         return;
       }
+      // 重置后用新密码登录，换取 token
+      const loginRes = await fetch(`${API_BASE}/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: name, password: resetInput.newPassword })
+      });
       closeReset();
-      saveUser({ token, password: resetInput.newPassword });
+      if (loginRes.ok) {
+        const data = await loginRes.json();
+        saveUser({ token: data.token, username: data.username, password: resetInput.newPassword });
+      } else {
+        setLoginError('密码已重置，请使用新密码登录');
+      }
     } catch {
       setLoginError('网络连接失败，请检查 Meow 服务是否运行');
     } finally {
@@ -230,7 +265,7 @@ export default function App() {
         setPwMessage({ type: 'error', text: await readError(res, '修改失败') });
         return;
       }
-      saveUser({ token: user.token, password: pwInput.newPassword });
+      saveUser({ ...user, password: pwInput.newPassword });
       setPwInput({ current: '', newPassword: '', confirmPassword: '' });
       setPwMessage({ type: 'success', text: '密码已修改' });
     } catch {
@@ -245,7 +280,9 @@ export default function App() {
     localStorage.removeItem('meow_user');
     setDevices([]);
     setMessages([]);
-    setAuthInput({ token: '', password: '' });
+    setAuthInput({ username: '', password: '', confirmPassword: '' });
+    setAuthMode('login');
+    setUsername('');
     setSearchTerm('');
     setPwInput({ current: '', newPassword: '', confirmPassword: '' });
     setPwMessage({ type: '', text: '' });
@@ -263,6 +300,7 @@ export default function App() {
       if (res.status === 401) return handleLogout();
       const data = await res.json();
       setDevices(data.devices || []);
+      setUsername(data.username || '');
     } catch (err) {
       console.error("获取设备失败", err);
     }
@@ -405,32 +443,24 @@ export default function App() {
             <div className="bg-green-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
               <CheckCircle className="text-green-500 w-8 h-8" />
             </div>
-            <h1 className="text-2xl font-bold text-slate-800">Meow 账号已就绪</h1>
-            <p className="text-slate-500 text-sm mt-2">请保存好凭证。登录后可修改密码，绑定设备后可通过推送验证码找回</p>
+            <h1 className="text-2xl font-bold text-slate-800">注册成功</h1>
+            <p className="text-slate-500 text-sm mt-2">用户名 <span className="font-bold text-slate-700">{newRegUser.username}</span>，以后用用户名和密码登录</p>
           </div>
           <div className="space-y-4 mb-8">
             <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 relative">
-              <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">推送 Token</label>
+              <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">你的推送 URL</label>
               <div className="flex items-center justify-between gap-2 font-mono text-sm">
-                <span className="truncate">{newRegUser.token}</span>
-                <button onClick={() => copyToClipboard(newRegUser.token, 'reg-token')} className="text-blue-500 hover:bg-blue-50 p-1 rounded transition relative">
+                <span className="truncate">{`${API_BASE}/${newRegUser.token}`}</span>
+                <button onClick={() => copyToClipboard(`${API_BASE}/${newRegUser.token}`, 'reg-url')} className="text-blue-500 hover:bg-blue-50 p-1 rounded transition relative">
                   <Copy size={16}/>
-                  {copyTip === 'reg-token' && <span className="absolute -top-8 left-1/2 -translate-x-1/2 bg-slate-800 text-white text-[10px] px-2 py-1 rounded shadow-lg animate-in fade-in zoom-in duration-200">已复制</span>}
+                  {copyTip === 'reg-url' && <span className="absolute -top-8 left-1/2 -translate-x-1/2 bg-slate-800 text-white text-[10px] px-2 py-1 rounded shadow-lg animate-in fade-in zoom-in duration-200">已复制</span>}
                 </button>
               </div>
+              <p className="text-xs text-slate-400 mt-2">把它填到 Bark / SMSForwarder 等应用里即可推送；登录后也能随时查看。</p>
             </div>
-            <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 relative">
-              <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">查询密码</label>
-              <div className="flex items-center justify-between gap-2 font-mono text-sm text-blue-600 font-bold">
-                <span className="truncate">{newRegUser.password}</span>
-                <button onClick={() => copyToClipboard(newRegUser.password, 'reg-pw')} className="text-blue-500 hover:bg-blue-50 p-1 rounded transition relative">
-                  <Copy size={16}/>
-                  {copyTip === 'reg-pw' && <span className="absolute -top-8 left-1/2 -translate-x-1/2 bg-slate-800 text-white text-[10px] px-2 py-1 rounded shadow-lg animate-in fade-in zoom-in duration-200">已复制</span>}
-                </button>
-              </div>
-            </div>
+            <p className="text-xs text-slate-400 flex items-start gap-1"><Info size={14} className="flex-shrink-0 mt-0.5"/>登录后在「设备分发」绑定你的 Bark 地址，忘记密码时验证码会推送到这些设备。</p>
           </div>
-          <button onClick={confirmRegistration} className="w-full bg-blue-600 text-white py-4 rounded-2xl font-bold hover:bg-blue-700 transition shadow-lg">我已妥善保存</button>
+          <button onClick={confirmRegistration} className="w-full bg-blue-600 text-white py-4 rounded-2xl font-bold hover:bg-blue-700 transition shadow-lg">进入 Meow</button>
         </div>
       </div>
     );
@@ -453,7 +483,7 @@ export default function App() {
           {loginError && <div className="mb-6 bg-red-50 border border-red-100 text-red-600 px-4 py-3 rounded-xl flex items-center gap-2 text-sm"><XCircle size={16}/>{loginError}</div>}
           {resetStep === 'request' ? (
             <form onSubmit={handleResetRequest} className="space-y-4">
-              <input type="text" placeholder="推送 Token" className={inputClass} value={resetInput.token} onChange={e => {setResetInput({...resetInput, token: e.target.value}); setLoginError('');}} />
+              <input type="text" autoComplete="username" placeholder="用户名（老用户为推送 Token）" className={inputClass} value={resetInput.username} onChange={e => {setResetInput({...resetInput, username: e.target.value}); setLoginError('');}} />
               <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold hover:bg-slate-800 transition flex justify-center items-center gap-2">
                 {loading && <RefreshCcw size={18} className="animate-spin" />} 发送验证码
               </button>
@@ -487,16 +517,29 @@ export default function App() {
             <p className="text-slate-500 text-sm mt-1">你的私有通知中转站</p>
           </div>
           {loginError && <div className="mb-6 bg-red-50 border border-red-100 text-red-600 px-4 py-3 rounded-xl flex items-center gap-2 text-sm"><XCircle size={16}/>{loginError}</div>}
-          <form onSubmit={handleLogin} className="space-y-4">
-            <input type="text" placeholder="推送 Token" className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none" value={authInput.token} onChange={e => {setAuthInput({...authInput, token: e.target.value}); setLoginError('');}} />
-            <input type="password" placeholder="查询密码" className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none" value={authInput.password} onChange={e => {setAuthInput({...authInput, password: e.target.value}); setLoginError('');}} />
-            <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold hover:bg-slate-800 transition flex justify-center items-center gap-2">
-              {loading && <RefreshCcw size={18} className="animate-spin" />} {loading ? "正在连接..." : "登录 Meow"}
-            </button>
-            <button type="button" onClick={openReset} className="w-full text-sm text-slate-400 hover:text-slate-600">忘记密码？</button>
-          </form>
+          {authMode === 'login' ? (
+            <form onSubmit={handleLogin} className="space-y-4">
+              <input type="text" autoComplete="username" placeholder="用户名（老用户为推送 Token）" className={inputClass} value={authInput.username} onChange={e => {setAuthInput({...authInput, username: e.target.value}); setLoginError('');}} />
+              <input type="password" autoComplete="current-password" placeholder="密码" className={inputClass} value={authInput.password} onChange={e => {setAuthInput({...authInput, password: e.target.value}); setLoginError('');}} />
+              <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold hover:bg-slate-800 transition flex justify-center items-center gap-2">
+                {loading && <RefreshCcw size={18} className="animate-spin" />} {loading ? "正在连接..." : "登录 Meow"}
+              </button>
+              <button type="button" onClick={openReset} className="w-full text-sm text-slate-400 hover:text-slate-600">忘记密码？</button>
+            </form>
+          ) : (
+            <form onSubmit={handleRegister} className="space-y-4">
+              <input type="text" autoComplete="username" placeholder="用户名（3-32 位字母、数字或 _ . -）" className={inputClass} value={authInput.username} onChange={e => {setAuthInput({...authInput, username: e.target.value}); setLoginError('');}} />
+              <input type="password" autoComplete="new-password" placeholder="密码（8-128 位）" className={inputClass} value={authInput.password} onChange={e => {setAuthInput({...authInput, password: e.target.value}); setLoginError('');}} />
+              <input type="password" autoComplete="new-password" placeholder="确认密码" className={inputClass} value={authInput.confirmPassword} onChange={e => {setAuthInput({...authInput, confirmPassword: e.target.value}); setLoginError('');}} />
+              <button type="submit" disabled={loading} className="w-full bg-slate-900 text-white py-3 rounded-xl font-bold hover:bg-slate-800 transition flex justify-center items-center gap-2">
+                {loading && <RefreshCcw size={18} className="animate-spin" />} {loading ? "正在注册..." : "注册并加入 Meow"}
+              </button>
+            </form>
+          )}
           <div className="relative my-8"><div className="absolute inset-0 flex items-center"><span className="w-full border-t border-slate-100"></span></div><div className="relative flex justify-center text-xs uppercase"><span className="bg-white px-2 text-slate-400">或者</span></div></div>
-          <button onClick={handleRegister} className="w-full border-2 border-slate-900 text-slate-900 py-3 rounded-xl font-bold hover:bg-slate-50 transition">加入 Meow</button>
+          <button onClick={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setLoginError(''); setAuthInput({ ...authInput, password: '', confirmPassword: '' }); }} className="w-full border-2 border-slate-900 text-slate-900 py-3 rounded-xl font-bold hover:bg-slate-50 transition">
+            {authMode === 'login' ? '注册新账号' : '已有账号，去登录'}
+          </button>
         </div>
       </div>
     );
@@ -509,7 +552,10 @@ export default function App() {
       <nav className="sticky top-0 z-10 bg-white/80 backdrop-blur-md border-b border-slate-200">
         <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-2 font-bold text-xl"><Send className="text-blue-500 w-6 h-6" /><span>Meow Hub</span></div>
-          <button onClick={handleLogout} className="flex items-center gap-2 text-sm font-medium text-red-500 hover:bg-red-50 px-3 py-2 rounded-lg transition"><LogOut size={18} /><span>退出</span></button>
+          <div className="flex items-center gap-2">
+            {(username || user.username) && <span className="text-sm text-slate-500 truncate max-w-[12rem]" title={username || user.username}>{username || user.username}</span>}
+            <button onClick={handleLogout} className="flex items-center gap-2 text-sm font-medium text-red-500 hover:bg-red-50 px-3 py-2 rounded-lg transition"><LogOut size={18} /><span>退出</span></button>
+          </div>
         </div>
       </nav>
 
