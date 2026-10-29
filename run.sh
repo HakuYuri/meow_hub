@@ -6,4 +6,5 @@ VENV_PATH="$APP_DIR/venv"
 
 exec $VENV_PATH/bin/uvicorn main:app \
     --host 0.0.0.0 \
-    --port 19988 
+    --port 19988 \
+    --timeout-graceful-shutdown 5

@@ -14,6 +14,7 @@ from typing import List, Optional, Dict, Any
 import httpx
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, text, or_
 from sqlalchemy.exc import IntegrityError
@@ -355,6 +356,36 @@ def verify_user(db: Session, token: str, password: str):
         raise HTTPException(status_code=401, detail="Invalid token or password")
     return user
 
+def message_dict(m: "PushMessage") -> dict:
+    return {
+        "id": m.id, "title": m.title, "subtitle": m.subtitle, "body": m.body,
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+        "deleted_at": m.deleted_at.isoformat() if m.deleted_at else None,
+        "params": m.raw_params,
+    }
+
+# --- 实时推送订阅（安卓客户端通过 /stream 长连接接收）---
+STREAM_PING_SECONDS = 25
+STREAM_BACKLOG_LIMIT = 50
+_subscribers: Dict[int, set] = {}
+
+def publish_to_user(user_id: int, event: str, data: dict):
+    for queue in list(_subscribers.get(user_id, ())):
+        try:
+            queue.put_nowait((event, data))
+        except asyncio.QueueFull:
+            pass
+
+def unsubscribe(user_id: int, queue: asyncio.Queue):
+    subs = _subscribers.get(user_id)
+    if subs is not None:
+        subs.discard(queue)
+        if not subs:
+            _subscribers.pop(user_id, None)
+
+def sse_event(event: str, data: Any) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
 async def process_incoming_push(db: Session, token: str, data: dict):
     user = db.query(User).filter(User.token == token).first()
     if not user: return False
@@ -369,6 +400,7 @@ async def process_incoming_push(db: Session, token: str, data: dict):
     )
     db.add(msg)
     db.commit()
+    publish_to_user(user.id, "message", message_dict(msg))
     urls = [d.url for d in user.devices]
     await message_queue.put({"urls": urls, "payload": data})
     return True
@@ -429,7 +461,7 @@ async def change_password(req: ChangePasswordRequest, db: Session = Depends(get_
     db.commit()
     return {"status": "success"}
 
-RESET_SENT_MESSAGE = "如果该用户存在且已绑定设备，验证码已推送到你的设备"
+RESET_SENT_MESSAGE = "如果该用户存在且已绑定设备或已登录安卓客户端，验证码已推送到你的设备"
 
 @app.post("/password/reset/request")
 async def request_password_reset(req: ResetRequest, db: Session = Depends(get_db)):
@@ -437,7 +469,7 @@ async def request_password_reset(req: ResetRequest, db: Session = Depends(get_db
     db.query(PasswordReset).filter(PasswordReset.expires_at < now).delete()
     db.commit()
     user = find_reset_user(db, req)
-    if not user or not user.devices:
+    if not user or (not user.devices and not _subscribers.get(user.id)):
         return {"status": "sent", "message": RESET_SENT_MESSAGE}
     latest = db.query(PasswordReset).filter(PasswordReset.user_id == user.id).order_by(PasswordReset.created_at.desc()).first()
     if latest and now - latest.created_at < RESET_CODE_COOLDOWN:
@@ -452,7 +484,8 @@ async def request_password_reset(req: ResetRequest, db: Session = Depends(get_db
         "body": f"验证码：{code}\n{minutes} 分钟内有效。如非本人操作请忽略。",
         "group": "Meow",
     }
-    # 不写入消息历史，直接推送到所有已绑定设备
+    # 不写入消息历史，直接推送到所有已绑定设备和在线的安卓客户端
+    publish_to_user(user.id, "notice", payload)
     await message_queue.put({"urls": [d.url for d in user.devices], "payload": payload})
     return {"status": "sent", "message": RESET_SENT_MESSAGE}
 
@@ -533,7 +566,52 @@ async def get_messages(req: MessageRequest, db: Session = Depends(get_db)):
     user = verify_user(db, req.token, req.password)
     order = PushMessage.deleted_at.desc() if req.trash else PushMessage.created_at.desc()
     msgs = message_query(db, user.id, req.trash, req.q).order_by(order, PushMessage.id.desc()).limit(req.limit).all()
-    return [{"id": m.id, "title": m.title, "subtitle": m.subtitle, "body": m.body, "created_at": m.created_at, "deleted_at": m.deleted_at, "params": m.raw_params} for m in msgs]
+    return [message_dict(m) for m in msgs]
+
+class StreamRequest(AuthBase):
+    since_id: Optional[int] = None  # 上次收到的最大消息 id；传入时补发其后的消息（最多 50 条）
+
+@app.post("/stream")
+async def stream(req: StreamRequest):
+    db = SessionLocal()
+    try:
+        user = verify_user(db, req.token, req.password)
+        user_id, username = user.id, user.username
+        # 先订阅再查补发，避免两者之间到达的消息丢失；客户端按 id 去重
+        queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        _subscribers.setdefault(user_id, set()).add(queue)
+        try:
+            latest = message_query(db, user_id, False).order_by(PushMessage.id.desc()).first()
+            latest_id = latest.id if latest else 0
+            backlog, backlog_total = [], 0
+            if req.since_id is not None:
+                newer = message_query(db, user_id, False).filter(PushMessage.id > req.since_id)
+                backlog_total = newer.count()
+                backlog = [message_dict(m) for m in reversed(newer.order_by(PushMessage.id.desc()).limit(STREAM_BACKLOG_LIMIT).all())]
+        except Exception:
+            unsubscribe(user_id, queue)
+            raise
+    finally:
+        db.close()
+
+    async def events():
+        try:
+            yield sse_event("hello", {"latest_id": latest_id, "username": username})
+            if req.since_id is not None:
+                yield sse_event("backlog", {"messages": backlog, "total": backlog_total})
+            while True:
+                try:
+                    event, data = await asyncio.wait_for(queue.get(), timeout=STREAM_PING_SECONDS)
+                    yield sse_event(event, data)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        finally:
+            unsubscribe(user_id, queue)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # 让 Nginx 不缓冲，事件即时下发
+    })
 
 @app.post("/messages/count")
 async def count_messages(req: MessageCountRequest, db: Session = Depends(get_db)):
